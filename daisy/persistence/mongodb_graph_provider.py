@@ -12,6 +12,14 @@ import numpy as np
 logger = logging.getLogger(__name__)
 
 
+def get_node_attribute_collection(attribute):
+    return 'nodes_' + attribute
+
+
+def get_edge_attribute_collection(attribute):
+    return 'edges_' + attribute
+
+
 class MongoDbGraphProvider(SharedGraphProvider):
     '''Provides shared graphs stored in a MongoDB.
 
@@ -142,6 +150,59 @@ class MongoDbGraphProvider(SharedGraphProvider):
 
         return nodes
 
+    def read_filtered_nodes(self, roi, attribute, value, separate=False):
+        '''Return a list of nodes within roi with given attribute/value pair.
+        If separate, look for node attribute in separate collection.'''
+
+        logger.debug("Querying nodes in %s with %s = %s"
+                     % (roi, attribute, value))
+
+        try:
+
+            self.__connect()
+            self.__open_db()
+            self.__open_collections()
+
+            pos_query = self.__pos_query(roi)
+            attribute_query = self.__attribute_query(attribute, value)
+
+            if separate:
+                nodes = []
+                coll_name = get_node_attribute_collection(attribute)
+                attr_coll = self.database[coll_name]
+                filtered = attr_coll.find(attribute_query)
+                node_ids = [entry['id'] for entry in filtered]
+                # limit query to 1M IDs (otherwise we might exceed the 16MB
+                # BSON document size limit)
+                length = len(node_ids)
+                query_size = 1000000
+                num_chunks = (length - 1)//query_size + 1
+                for i in range(num_chunks):
+
+                    i_b = i*query_size
+                    i_e = min((i + 1)*query_size, len(node_ids))
+                    assert i_b < len(node_ids)
+                    id_query = {'id': {'$in': node_ids[i_b:i_e]}}
+                    query = {'$and': [pos_query, id_query]}
+                    nodes += self.nodes.find(query)
+
+                if num_chunks > 0:
+                    assert i_e == len(node_ids)
+
+            else:
+                query = {'$and': [pos_query, attribute_query]}
+                nodes = self.nodes.find(query, {'_id': False})
+                nodes = list(nodes)
+
+        finally:
+
+            self.__disconnect()
+
+        for node in nodes:
+            node['id'] = np.uint64(node['id'])
+
+        return nodes
+
     def num_nodes(self, roi):
         '''Return the number of nodes in the roi.'''
 
@@ -235,11 +296,108 @@ class MongoDbGraphProvider(SharedGraphProvider):
 
         return edges
 
+    def read_filtered_edges(self, roi, attribute, value,
+                            nodes=None, separate=False):
+        '''Returns a list of edges within roi with attribute=value.
+        If separate, check separate collection for edge attribute values'''
+
+        if nodes is None:
+            nodes = self.read_nodes(roi)
+        node_ids = list([int(np.int64(n['id'])) for n in nodes])
+        logger.debug("found %d nodes", len(node_ids))
+        logger.debug("looking for edges with u in %s", node_ids)
+
+        edges = []
+        try:
+
+            self.__connect()
+            self.__open_db()
+            self.__open_collections()
+
+            # limit query to 1M node IDs (otherwise we might exceed the 16MB
+            # BSON document size limit)
+            length = len(node_ids)
+            query_size = 1000000
+            num_chunks = (length - 1)//query_size + 1
+            for i in range(num_chunks):
+
+                i_b = i*query_size
+                i_e = min((i + 1)*query_size, len(node_ids))
+                assert i_b < len(node_ids)
+                pos_query = {self.endpoint_names[0]:
+                             {'$in': node_ids[i_b:i_e]}}
+                attribute_query = self.__attribute_query(attribute, value)
+                if separate:
+                    query = pos_query
+                else:
+                    query = {'$and': [pos_query, attribute_query]}
+                edges += self.edges.find(query)
+
+            if num_chunks > 0:
+                assert i_e == len(node_ids)
+
+            logger.debug("found %d edges", len(edges))
+            logger.debug("read edges: %s", edges)
+
+            if separate:
+                if len(edges) > 1000000:
+                    logger.warn("Query may exceed BSON document size limit")
+                edge_ids = [edge['_id'] for edge in edges]
+                attribute_query = self.__attribute_query(attribute, value)
+                id_query = {'_id': {'$in': edge_ids}}
+                coll_name = get_edge_attribute_collection(attribute)
+                attribute_coll = self.database[coll_name]
+                filtered_results = attribute_coll.find(
+                        {'$and': [attribute_query, id_query]})
+                filtered_ids = [edge['_id'] for edge in filtered_results]
+                edges = [edge for edge in edges
+                         if edge['_id'] in filtered_ids]
+
+        finally:
+
+            self.__disconnect()
+
+        for edge in edges:
+            u, v = self.endpoint_names
+            edge[u] = np.uint64(edge[u])
+            edge[v] = np.uint64(edge[v])
+            if separate:
+                del edge['_id']
+
+        return edges
+
     def __getitem__(self, roi):
 
         nodes = self.read_nodes(roi)
         edges = self.read_edges(roi, nodes)
+        return self.__get_subgraph(nodes, edges, roi)
 
+    def get_filtered_subgraph(
+            self,
+            roi,
+            node_attr=None,
+            node_value=None,
+            node_separate=False,
+            edge_attr=None,
+            edge_value=None,
+            edge_separate=False):
+
+        if node_attr:
+            nodes = self.read_filtered_nodes(
+                        roi, node_attr, node_value, separate=node_separate)
+        else:
+            nodes = self.read_nodes(roi)
+
+        if edge_attr:
+            edges = self.read_filtered_edges(
+                        roi, edge_attr, edge_value,
+                        nodes=nodes, separate=edge_separate)
+        else:
+            edges = self.read_edges(roi, nodes=nodes)
+
+        return self.__get_subgraph(nodes, edges, roi)
+
+    def __get_subgraph(self, nodes, edges, roi):
         u, v = self.endpoint_names
         node_list = [
                 (n['id'], self.__remove_keys(n, ['id']))
@@ -356,6 +514,44 @@ class MongoDbGraphProvider(SharedGraphProvider):
             name='incident',
             unique=True)
 
+    def prepare_node_attribute_collection(self, attribute, clear=False):
+        '''Creates the node attribute collection, including indexes'''
+        self.__connect()
+        self.__open_db()
+        coll_name = get_node_attribute_collection(attribute)
+        coll = self.database[coll_name]
+        if clear:
+            coll.drop()
+
+        coll.create_index(
+            [
+                ('id', ASCENDING)
+            ],
+            name='id',
+            unique=True)
+        coll.create_index(
+            [
+                (attribute, ASCENDING)
+            ],
+            name=attribute)
+        self.__disconnect()
+
+    def prepare_edge_attribute_collection(self, attribute, clear=False):
+        '''Creates the edge collection, including indexes'''
+        self.__connect()
+        self.__open_db()
+        coll_name = get_edge_attribute_collection(attribute)
+        coll = self.database[coll_name]
+        if clear:
+            coll.drop()
+
+        coll.create_index(
+            [
+                (attribute, ASCENDING)
+            ],
+            name=attribute)
+        self.__disconnect()
+
     def __check_metadata(self):
         '''Checks if the provided metadata matches the existing
         metadata in the meta collection'''
@@ -420,6 +616,9 @@ class MongoDbGraphProvider(SharedGraphProvider):
                 'position.%d' % d: {'$gte': b, '$lt': e}
                 for d, (b, e) in enumerate(zip(begin, end))
             }
+
+    def __attribute_query(self, attribute, value):
+        return {attribute: value}
 
 
 class MongoDbSharedSubGraph(SharedSubGraph):
@@ -610,6 +809,130 @@ class MongoDbSharedSubGraph(SharedSubGraph):
 
             logger.error(e.details)
             raise
+
+    def write_nodes_attribute_in_collection(
+            self,
+            attribute,
+            roi=None,
+            fail_if_not_exists=True):
+        if roi is None:
+            roi = self.roi
+
+        coll_name = get_node_attribute_collection(attribute)
+        collections = self.database.list_collection_names()
+        if coll_name not in collections:
+            raise Exception(
+                "No collection %s. Must initialize collection for node"
+                " attribute %s in MongoDbGraphProvider before writing"
+                " to it in MongoDbSubGraph"
+                % (coll_name, attribute))
+        coll = self.database[coll_name]
+        nodes = []
+        for node_id, data in self.nodes(data=True):
+
+            if not self.__contains(roi, node_id):
+                logger.debug(
+                        "Skipping node {} with data {} because not in roi {}"
+                        .format(node_id, data, roi))
+                continue
+
+            node = {
+                'id': int(np.int64(node_id))
+            }
+            if attribute in data:
+                node[attribute] = data[attribute]
+            else:
+                logger.warn("Skipping node %s because does not contain"
+                            " attribute %s" % (node_id, attribute))
+                continue
+            found_node = self.nodes_collection.find_one({
+                'id': int(np.int64(node['id']))
+                })
+            if not found_node and fail_if_not_exists:
+                raise Exception("Could not find existing node %s. Aborting."
+                                % node['id'])
+            elif not found_node:
+                logger.warn("Inserting node id %s into main collection"
+                            % node['id'])
+                self.nodes_collection.insert_one({
+                    'id': int(np.int64(node['id']))
+                })
+
+            nodes.append(node)
+        coll.bulk_write([
+            ReplaceOne(
+                {
+                    'id': int(np.int64(node['id'])),
+                },
+                node,
+                upsert=True
+            )
+            for node in nodes
+        ])
+
+    def write_edge_attribute_in_collection(
+            self,
+            attribute,
+            roi=None,
+            fail_if_not_exists=True):
+        if roi is None:
+            roi = self.roi
+
+        coll_name = get_edge_attribute_collection(attribute)
+        collections = self.database.list_collection_names()
+        if coll_name not in collections:
+            raise Exception(
+                "No collection %s. Must initialize collection for edge"
+                " attribute %s in MongoDbGraphProvider before writing"
+                " to it in MongoDbSubGraph"
+                % (coll_name, attribute))
+        coll = self.database[coll_name]
+        edges = []
+        u_name, v_name = self.endpoint_names
+        for u, v, data in self.edges(data=True):
+            if not self.is_directed():
+                u, v = min(u, v), max(u, v)
+            if not self.__contains(roi, u):
+                logger.debug(
+                        ("Skipping edge with u {}, v {}," +
+                         "and data {} because u not in roi {}")
+                        .format(u, v, data, roi))
+                continue
+
+            edge = {
+                u_name: int(np.int64(u)),
+                v_name: int(np.int64(v)),
+            }
+            if attribute not in data:
+                logger.warn("Skipping edge from %s to %s because"
+                            " does not contain attribute %s"
+                            % (u, v, attribute))
+                continue
+            found_edge = self.edges_collection.find_one(edge)
+
+            if not found_edge and fail_if_not_exists:
+                raise Exception("Could not find existing edge %s. Aborting."
+                                % edge)
+            elif not found_edge:
+                logger.warn("Inserting edge %s into main collection"
+                            % edge)
+                write_return = self.nodes_collection.insert_one(edge)
+                _id = write_return['insertedId']
+            else:
+                _id = found_edge['_id']
+            edge_attr = {'_id': _id,
+                         attribute: data[attribute]}
+            edges.append(edge_attr)
+        coll.bulk_write([
+            ReplaceOne(
+                {
+                    '_id': edge['_id']
+                },
+                edge,
+                upsert=True
+            )
+            for edge in edges
+        ])
 
     def __contains(self, roi, node):
         '''Determines if the given node is inside the given roi'''
