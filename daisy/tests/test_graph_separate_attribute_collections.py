@@ -3,6 +3,9 @@ from __future__ import absolute_import
 import daisy
 import logging
 import unittest
+import time
+import random
+import sys
 
 logger = logging.getLogger(__name__)
 # logging.basicConfig(level=logging.DEBUG)
@@ -142,3 +145,89 @@ class TestFilterMongoGraph(unittest.TestCase):
         self.assertFalse('swip' in compare_graph.edges[2, 42])
         self.assertFalse('selected' in compare_graph.edges[42, 23])
         self.assertEqual('swim', compare_graph.edges[42, 2]['swip'])
+
+    def get_random_nodes(self, num_nodes, attrs, roi):
+        offset = roi.get_offset()
+        o1, o2, o3 = offset
+        shape = roi.get_shape()
+        s1, s2, s3 = shape
+        return [
+                (n, dict(
+                    {'position': [random.randrange(offset, offset + shape)
+                                  for offset, shape in zip(
+                                      roi.get_offset(),
+                                      roi.get_shape())]},
+                    **{attr: random.choice([True, False])
+                       for attr in attrs}))
+                for n in range(num_nodes)
+            ]
+
+    def get_random_edges(self, num_nodes, num_edges, attrs):
+        return [
+                (random.randrange(0, num_nodes),
+                 random.randrange(0, num_nodes),
+                 {attr: random.choice([True, False])
+                     for attr in attrs})
+                for n in range(num_edges)
+            ]
+
+    def benchmark_graph_separate_collections(self):
+        num_attrs = 4
+        attrs = ['attr_' + str(a) for a in range(num_attrs)]
+        powers_10 = 5
+        edges_per_node = 2
+
+        write_times = {}
+        read_times = {}
+        for power in range(1, powers_10):
+            num_nodes = 10 ** power
+            num_edges = num_nodes * edges_per_node
+            roi = daisy.Roi((0, 0, 0),
+                            (num_nodes, num_nodes, num_nodes))
+            nodes = self.get_random_nodes(num_nodes, attrs, roi)
+            edges = self.get_random_edges(num_nodes, num_edges, attrs)
+            write_times_by_num_separate = {}
+            read_times_by_num_separate = {}
+            for num_separate in range(num_attrs):
+                separate_attrs = {attr: [attr]
+                                  for attr in attrs[:num_separate]}
+                write_provider = self.get_mongo_graph_provider(
+                        'w', separate_attrs, separate_attrs)
+                write_graph = write_provider[roi]
+                write_graph.add_nodes_from(nodes)
+                write_graph.add_edges_from(edges)
+                write_start_time = time.time()
+                write_graph.write_nodes()
+                write_graph.write_edges()
+                write_time = time.time() - write_start_time
+                write_times_by_num_separate[num_separate] = write_time
+
+                read_provider = self.get_mongo_graph_provider(
+                        'r', separate_attrs, separate_attrs)
+                read_start_time = time.time()
+                read_provider[roi]
+                read_time = time.time() - read_start_time
+                read_times_by_num_separate[num_separate] = read_time
+            write_times[num_nodes] = write_times_by_num_separate
+            read_times[num_nodes] = read_times_by_num_separate
+
+        self.print_times('write', write_times)
+        self.print_times('read', read_times)
+
+    def print_times(self, title, times):
+        print('Benchmark %s times:' % title)
+        x_axis_values = None
+        for num_nodes, line_values in times.items():
+            if x_axis_values is None:
+                x_axis_values = line_values.keys()
+                x_axis_strings = [str(v) for v in x_axis_values]
+                print('\t%s' % '\t'.join(x_axis_strings))
+            values = ['%.3f' % line_values[key] for key in x_axis_values]
+            line = str(num_nodes) + '\t' + '\t'.join(values)
+            print(line)
+
+
+if __name__ == '__main__':
+    if sys.argv[1] == 'benchmark':
+        test = TestFilterMongoGraph()
+        test.benchmark_graph_separate_collections()
